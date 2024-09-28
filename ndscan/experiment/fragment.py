@@ -586,11 +586,19 @@ class Fragment(HasEnvironment):
 
         del self._free_params[param_name]
 
+        # Record where this ParamHandle was rebound to
         self._rebound_own_params[param_name] = source
 
+        # Add all ParamHandles currently pointing at this parameter in this
+        # Fragment to the top level Fragment instead
         toplevel_source.owner._rebound_subfragment_params.setdefault(
             toplevel_source.name,
             []).extend(self._get_all_handles_for_param(param_name))
+
+        # If this parameter was previously a target of rebinds, remove it from
+        # this Fragment's list
+        if param_name in self._rebound_subfragment_params:
+            del self._rebound_subfragment_params[param_name]
 
         return param
 
