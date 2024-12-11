@@ -60,11 +60,6 @@ class Fragment(HasEnvironment):
         #: attribute names of the respective ParamHandles) to *Param instances.
         self._free_params = OrderedDict()
 
-        #: Maps own attribute name to the ParamHandles of the rebound parameters in
-        #: their original subfragment (currently always only one, as there is only a
-        #: rebinding API that targets single paths).
-        self._rebound_subfragment_params = dict()
-
         #: List of (param, store) tuples of parameters set to their defaults after
         #: init_params().
         self._default_params = []
@@ -371,7 +366,7 @@ class Fragment(HasEnvironment):
         param = param_class(fqn, description, *args, **kwargs)
         self._free_params[name] = param
 
-        handle = param.HandleType(self, name)
+        handle = param.HandleType(self, name, param)
         setattr(self, name, handle)
         return handle
 
@@ -420,7 +415,7 @@ class Fragment(HasEnvironment):
         init_params["fqn"] = self.fqn + "." + name
         new_param = template_param.__class__(**init_params)
         self._free_params[name] = new_param
-        new_handle = new_param.HandleType(self, name)
+        new_handle = new_param.HandleType(self, name, new_param)
         setattr(self, name, new_handle)
         return new_handle
 
@@ -526,31 +521,45 @@ class Fragment(HasEnvironment):
         ``Fluoresce``, binding its intensity and detuning parameters to values and
         defaults appropriate for those particular tasks.
 
+        Transitive binding is supported: if the source parameter is itself bound /
+        overridden, this parameter will be bound to the ultimate source.
+
         See :meth:`override_param`, which sets the parameter to a fixed value/store.
 
         :param param_name: The name of the parameter to be bound (i.e.
             ``self.<param_name>``). Must be a free parameter of this fragment (not
             already bound or overridden).
-        :param source: The parameter to bind to. Must be a free parameter of its
-            respective owner.
+        :param source: The parameter to bind to. Can be free, overridden or rebound.
         """
         param = self._free_params.get(param_name, None)
         assert param is not None, f"Not a free parameter: '{param_name}'"
 
-        # We don't support "transitive" binding for parameters that are already bound.
-        assert source.name in source.owner._free_params, \
-            "Source parameter is not a free parameter; already bound/overridden?"
+        # To support "transitive" binding of parameters, follow the chaining of
+        # rebindings until the top-level source is found.
+        toplevel_handle = source._get_toplevel_handle()
 
-        own_type = type(self._free_params[param_name])
-        source_type = type(source.owner._free_params[source.name])
-        assert own_type == source_type, (
-            f"Cannot bind {own_type.__name__} '{param_name}' " +
-            f"to source of type {source_type.__name__}")
+        # Compare the types of the ParamHandles instead of the Params. In the
+        # case of EnumParams, this will catch an attempt bind the wrong type of
+        # EnumParam to another EnumParam.
+        param_handle: ParamHandle = getattr(self, param_name)
+        own_handle_type = type(param_handle)
+        toplevel_handle_type = type(toplevel_handle)
+        assert own_handle_type == toplevel_handle_type, (
+            f"Cannot bind {own_handle_type.__name__} '{param_name}' " +
+            f"to source of type {toplevel_handle_type.__name__}")
 
+        # Record the new rebinding
         del self._free_params[param_name]
+        source._add_child_handle(param_handle)
 
-        source.owner._rebound_subfragment_params.setdefault(source.name, []).extend(
-            self._get_all_handles_for_param(param_name))
+        # Redirect the Parameter and ParamStores of all the bound handles to the
+        # new toplevel
+        toplevel_store = toplevel_handle.get_store()
+        for handle in toplevel_handle._get_all_handles_for_param():
+            if toplevel_store is not None:
+                handle.set_store(toplevel_store)
+
+            handle.parameter = toplevel_handle.parameter
 
         return param
 
@@ -717,7 +726,8 @@ class Fragment(HasEnvironment):
         return [getattr(self, name) for name in self._free_params.keys()]
 
     def _get_all_handles_for_param(self, name: str) -> list[ParamHandle]:
-        return [getattr(self, name)] + self._rebound_subfragment_params.get(name, [])
+        handle: ParamHandle = getattr(self, name)
+        return handle._get_all_handles_for_param()
 
     def _stringize_path(self) -> str:
         return "/".join(self._fragment_path)
@@ -753,7 +763,7 @@ class ExpFragment(Fragment):
         (see ``artiq.language.environment.Experiment.prepare``).
 
         This is invoked only once per (sub)scan, after :meth:`Fragment.build_fragment`
-        but before :meth:`.host_setup`. At this point, parameters, datasets and devices
+        but before :meth:`host_setup`. At this point, parameters, datasets and devices
         can be accessed, but devices must not yet be.
 
         For top-level scans, this can (and will) be executed in the `prepare` scheduler

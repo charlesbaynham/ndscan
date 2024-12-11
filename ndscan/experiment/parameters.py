@@ -1,4 +1,8 @@
 """Fragment-side parameter containers.
+
+In practical use, these will be instantiated by calling :meth:`Fragment.setattr_param`
+with the appropriate type argument (:class:`FloatParam`, :class:`IntParam`,
+:class:`StringParam`, :class:`BoolParam`, :class:`EnumParam`).
 """
 
 # The ARTIQ compiler does not support templates or generics (neither in the sense
@@ -7,14 +11,19 @@
 # but to hang our heads in shame and manually instantiate the parameter handling
 # machinery for all supported value types, in particular to handle cases where e.g.
 # both an int and a float parameter is scanned at the same time.
-
 from artiq.language import host_only, portable, units
 from enum import Enum
 from numpy import int32
-from typing import Any
+from typing import Any, TYPE_CHECKING, Optional
 from ..utils import eval_param_default, GetDataset
 
-__all__ = ["FloatParam", "IntParam", "StringParam", "BoolParam", "EnumParam"]
+__all__ = [
+    "InvalidDefaultError", "ParamStore", "ParamHandle", "FloatParam", "IntParam",
+    "StringParam", "BoolParam", "EnumParam"
+]
+
+if TYPE_CHECKING:
+    from .fragment import Fragment
 
 
 class InvalidDefaultError(ValueError):
@@ -40,18 +49,34 @@ class ParamStore:
         self._value = self.coerce(value)
 
     @host_only
-    def register_handle(self, handle):
+    def _register_handle(self, handle):
+        # Private to this module (part of the handle change_after_used tracking).
         self._handles.append(handle)
         self._notify = self._notify_handles
 
     @host_only
-    def unregister_handle(self, handle):
+    def _unregister_handle(self, handle):
+        # Private to this module (part of the handle change_after_used tracking).
         self._handles.remove(handle)
 
         if not self._handles:
             self._notify = self._do_nothing
 
-    RpcType = Any  # to be overridden by subclasses
+    #: The type to use for this parameter in the RPC layer (to be overridden by
+    #: subclasses).
+    RpcType = Any
+
+    @portable
+    def get_value(self) -> Any:
+        raise NotImplementedError
+
+    @portable
+    def set_value(self, value: Any) -> None:
+        raise NotImplementedError
+
+    @portable
+    def coerce(self, value: Any) -> Any:
+        raise NotImplementedError
 
     @host_only
     def to_rpc_type(self, value) -> RpcType:
@@ -70,6 +95,8 @@ class ParamStore:
 
     @classmethod
     def value_from_pyon(cls, value):
+        """
+        """
         return value
 
 
@@ -210,36 +237,84 @@ class ParamHandle:
     Each instance of this class corresponds to exactly one attribute of a fragment that
     can be used to access the underlying parameter store.
 
-    :param owner: The owning fragment.
-    :param name: The name of the attribute in the owning fragment bound to this
-        object.
+    :param owner: See :attr:`owner`.
+    :param name: See :attr:`name`.
+    :param parameter: The parameter initially associated with this handle (see
+        :attr:`parameter`).
     """
-    def __init__(self, owner: Any, name: str):
-        # `owner` will typically be a Fragment instance; no type hint to avoid circular
-        # dependency.
+    def __init__(self, owner: "Fragment", name: str, parameter):
+        #: The :class:`Fragment` owning this parameter handle.
         self.owner = owner
+
+        #: The name of the attribute in the owning fragment that corresponds to this
+        #: object.
         self.name = name
+
+        #: Points to the parameter currently associated with this handle, tracking
+        #: binding of the parameter.
+        self.parameter = parameter
+
         assert name.isidentifier(), ("ParamHandle name should be the identifier it is "
                                      "referred to as in the owning fragment.")
 
         self._store = None
         self._changed_after_use = True
 
-    def set_store(self, store) -> None:
+        self._parent_handle: ParamHandle | None = None
+        self._children_handles: list[ParamHandle] = []
+
+    def get_store(self) -> Optional[ParamStore]:
+        """
+        """
+        return self._store
+
+    def set_store(self, store: ParamStore) -> None:
+        """
+        """
         if self._store:
-            self._store.unregister_handle(self)
-        store.register_handle(self)
+            self._store._unregister_handle(self)
+        store._register_handle(self)
         self._store = store
         self._changed_after_use = True
 
     @portable
-    def _change_cb(self):
-        # Once transform lambdas are supported, handle them here.
-        self._changed_after_use = True
-
-    @portable
     def changed_after_use(self) -> bool:
+        """
+        """
         return self._changed_after_use
+
+    @host_only
+    def _get_toplevel_handle(self) -> "ParamHandle":
+        """
+        Get the highest level ParamHandle in the chain of bound parameters
+
+        Walks the DAG of bound parameters to find the highest level handle.
+        That may be this ParamHandle if this parameter is not rebound.
+        """
+        if self._parent_handle is None:
+            return self
+        else:
+            return self._parent_handle._get_toplevel_handle()
+
+    @host_only
+    def _get_all_handles_for_param(self) -> list["ParamHandle"]:
+        """
+        Get all handles that are bound to this handle (including this one)
+
+        Walks the DAG of bound parameters to find all child handles.
+        """
+        result = [self]
+        for child in self._children_handles:
+            result.extend(child._get_all_handles_for_param())
+        return result
+
+    @host_only
+    def _add_child_handle(self, rebound_handle: "ParamHandle"):
+        """
+        Mark a new parameter handle as being rebound to this one
+        """
+        rebound_handle._parent_handle = self
+        self._children_handles.append(rebound_handle)
 
 
 class FloatParamHandle(ParamHandle):
@@ -299,14 +374,35 @@ def resolve_numeric_scale(scale: float | None, unit: str) -> float:
 
 
 class ParamBase:
+    HandleType = ParamHandle
+    StoreType = ParamStore
+
     def __init__(self, **kwargs):
         # Store kwargs for param rebinding
         self.init_params = kwargs
         for k, v in kwargs.items():
             setattr(self, k, v)
 
+    def describe(self) -> dict[str, Any]:
+        """
+        """
+        raise NotImplementedError
+
+    def eval_default(self, get_dataset: GetDataset) -> Any:
+        """
+        """
+        raise NotImplementedError
+
+    def make_store(self, identity: tuple[str, str], value: float) -> ParamStore:
+        """
+        """
+        raise NotImplementedError
+
 
 class FloatParam(ParamBase):
+    """
+    """
+
     HandleType = FloatParamHandle
     StoreType = FloatParamStore
     CompilerType = float  # deprecated (not used in ndscan anymore); will go away
@@ -337,6 +433,7 @@ class FloatParam(ParamBase):
         self.step = step if step is not None else self.scale / 10.0
 
     def describe(self) -> dict[str, Any]:
+        """"""
         spec = {
             "is_scannable": self.is_scannable,
             "scale": self.scale,
@@ -358,11 +455,13 @@ class FloatParam(ParamBase):
         }
 
     def eval_default(self, get_dataset: GetDataset) -> float:
+        """"""
         if isinstance(self.default, str):
             return eval_param_default(self.default, get_dataset)
         return self.default
 
     def make_store(self, identity: tuple[str, str], value: float) -> FloatParamStore:
+        """"""
         if self.min is not None and value < self.min:
             raise InvalidDefaultError(
                 f"Value {value} for parameter {self.fqn} below minimum of {self.min}")
@@ -373,6 +472,9 @@ class FloatParam(ParamBase):
 
 
 class IntParam(ParamBase):
+    """
+    """
+
     HandleType = IntParamHandle
     StoreType = IntParamStore
     CompilerType = int32  # deprecated (not used in ndscan anymore); will go away
@@ -405,6 +507,7 @@ class IntParam(ParamBase):
         self.is_scannable = is_scannable
 
     def describe(self) -> dict[str, Any]:
+        """"""
         spec = {"is_scannable": self.is_scannable, "scale": self.scale}
         if self.min is not None:
             spec["min"] = self.min
@@ -421,11 +524,13 @@ class IntParam(ParamBase):
         }
 
     def eval_default(self, get_dataset: GetDataset) -> int:
+        """"""
         if isinstance(self.default, str):
             return eval_param_default(self.default, get_dataset)
         return self.default
 
     def make_store(self, identity: tuple[str, str], value: int) -> IntParamStore:
+        """"""
         if self.min is not None and value < self.min:
             raise InvalidDefaultError(
                 f"Value {value} for parameter {self.fqn} below minimum of {self.min}")
@@ -441,6 +546,9 @@ def _raise_not_implemented(*args):
 
 
 class StringParam(ParamBase):
+    """
+    """
+
     HandleType = StringParamHandle
     StoreType = StringParamStore
     CompilerType = str  # deprecated (not used in ndscan anymore); will go away
@@ -470,6 +578,7 @@ class StringParam(ParamBase):
                            is_scannable=is_scannable)
 
     def describe(self) -> dict[str, Any]:
+        """"""
         return {
             "fqn": self.fqn,
             "description": self.description,
@@ -481,13 +590,18 @@ class StringParam(ParamBase):
         }
 
     def eval_default(self, get_dataset: GetDataset) -> str:
+        """"""
         return eval_param_default(self.default, get_dataset)
 
     def make_store(self, identity: tuple[str, str], value: str) -> StringParamStore:
+        """"""
         return StringParamStore(identity, value)
 
 
 class BoolParam(ParamBase):
+    """
+    """
+
     HandleType = BoolParamHandle
     StoreType = BoolParamStore
     CompilerType = bool  # deprecated (not used in ndscan anymore); will go away
@@ -503,6 +617,7 @@ class BoolParam(ParamBase):
                          is_scannable=is_scannable)
 
     def describe(self) -> dict[str, Any]:
+        """"""
         return {
             "fqn": self.fqn,
             "description": self.description,
@@ -514,11 +629,13 @@ class BoolParam(ParamBase):
         }
 
     def eval_default(self, get_dataset: GetDataset) -> bool:
+        """"""
         if isinstance(self.default, str):
             return eval_param_default(self.default, get_dataset)
         return self.default
 
     def make_store(self, identity: tuple[str, str], value: bool) -> BoolParamStore:
+        """"""
         return BoolParamStore(identity, value)
 
 
@@ -590,6 +707,9 @@ def _get_enum_compiler_types(
 
 
 class EnumParam(ParamBase):
+    """
+    """
+
     # EnumParam can't support HandleType/StoreType as class attributes, as we need
     # one class per actual enum type
 
@@ -626,6 +746,7 @@ class EnumParam(ParamBase):
                          is_scannable=is_scannable)
 
     def describe(self) -> dict[str, Any]:
+        """"""
         # Mapping names of `enum` members to display strings. At this point, we
         # decide to display `enum.value` instead of `enum.name` if the former is
         # a string.
@@ -651,6 +772,7 @@ class EnumParam(ParamBase):
         }
 
     def eval_default(self, get_dataset: GetDataset) -> Enum:
+        """"""
         if isinstance(self.default, str):
 
             def to_member(value):
@@ -668,4 +790,5 @@ class EnumParam(ParamBase):
         return self.default
 
     def make_store(self, identity: tuple[str, str], value: Enum) -> ParamStore:
+        """"""
         return self.StoreType(identity, value)
